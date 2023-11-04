@@ -1,5 +1,5 @@
 """"
-Implements a data structure for loading point clouds from the SkullBreak dataset
+Implements a data structure for loading point clouds from a dataset
 """
 
 import csv
@@ -8,7 +8,7 @@ import open3d as o3d
 import torch as th
 
 
-class SkullBreakDataset(th.utils.data.Dataset):
+class BrokenDataset(th.utils.data.Dataset):
     def __init__(self, path, num_points, num_nn, norm_mode, num_samples=1, eval=False, augment=False):
         super().__init__()
         self.directory = path
@@ -16,7 +16,7 @@ class SkullBreakDataset(th.utils.data.Dataset):
         self.num_nn = num_nn
         self.database = []
         self.norm_mode = norm_mode
-        self.defects = ['bilateral', 'frontoorbital', 'parietotemporal', 'random_1', 'random_2']
+        self.defects = ['broken']
         self.num_samples = num_samples
         self.eval = eval
         self.augment = augment
@@ -24,18 +24,16 @@ class SkullBreakDataset(th.utils.data.Dataset):
         with open(self.directory, 'r') as file:
             csv_reader = csv.reader(file)
             for row in csv_reader:
-                for defect_id in range(5):
-                    datapoint = dict()
-                    datapoint['defective_skull'] = row[0].split('complete')[0] + 'defective_skull/' + self.defects[defect_id] + \
-                                                   row[0].split('skull')[1].split('.')[0] + '_surf.npy'
-                    datapoint['implant'] = row[0].split('complete')[0] + 'implant/' + self.defects[defect_id] + \
-                                           row[0].split('skull')[1].split('.')[0] + '_surf.npy'
-                    self.database.append(datapoint)
+                datapoint = dict()
+                path, obj = row[0].split('complete')
+                datapoint['broken'] = path + 'broken' + obj.split('.')[0] + '_surf.npy'
+                datapoint['repair'] = path + 'repair' + obj.split('.')[0] + '_surf.npy'
+                self.database.append(datapoint)
 
     def __getitem__(self, file):
         filedict = self.database[file]
-        name = filedict['defective_skull']
-        pc_np = np.load(filedict['defective_skull'])  # Points belonging to the defective anatomical structure
+        name = filedict['broken']
+        pc_np = np.load(filedict['broken'])  # Points belonging to the defective structure
 
         # Downsample point clouds
         num_pc = pc_np.shape[0]
@@ -44,7 +42,7 @@ class SkullBreakDataset(th.utils.data.Dataset):
 
         # During training
         if not self.eval:  # Load and concat points belonging to the ground truth implant (just for training)
-            pc_i_np = np.load(filedict['implant'])
+            pc_i_np = np.load(filedict['repair'])
             num_pc_i = pc_i_np.shape[0]
             idx_pc_i = np.random.randint(0, num_pc_i, self.num_nn)
             pc_i_np = pc_i_np[idx_pc_i, :]

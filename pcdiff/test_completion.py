@@ -6,8 +6,7 @@ from torch.distributions import Normal
 from model.pvcnn_completion import PVCNN2Base
 from utils.file_utils import *
 from tqdm import tqdm
-from datasets.skullbreak_data import SkullBreakDataset
-from datasets.skullfix_data import SkullFixDataset
+from datasets.broken_data import BrokenDataset
 '''
 ----- Models -----
 '''
@@ -503,12 +502,8 @@ def get_betas(schedule_type, b_start, b_end, time_num):
 
 #############################################################################
 def get_dataset(path, num_points, num_nn, dataset):
-    if dataset == 'SkullBreak':
-        te_dataset = SkullBreakDataset(path=path, num_points=num_points, num_nn=num_nn, norm_mode='shape_bbox',
+    te_dataset = BrokenDataset(path=path, num_points=num_points, num_nn=num_nn, norm_mode='shape_bbox',
                                        eval=True)
-    else:
-        te_dataset = SkullFixDataset(path=path, num_points=num_points, num_nn=num_nn, norm_mode='shape_bbox',
-                                     eval=True)
     return te_dataset
 
 
@@ -582,7 +577,7 @@ def main(opt):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--path', type=str, help="set the path to the dataset here")
-    parser.add_argument('--dataset', type=str, help="specify the used dataset (SkullBreak or SkullFix)")
+    parser.add_argument('--dataset', type=str, help="specify the used dataset")
     parser.add_argument('--model', default='', required=True, help="path to model to sample from")
     parser.add_argument('--num_ens', type=int, default=1, help='number of samples for ensembling')
     parser.add_argument('--sampling_method', type=str, default='ddpm', help='ddpm or ddim')
