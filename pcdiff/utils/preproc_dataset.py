@@ -11,51 +11,55 @@ import sys
 
 data_dir = 'data/pjaramil/'
 
-# Path to the complete_skull folder of SkullBreak dataset
-dataset = '_bottles'
+
+
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--multiprocessing', type=eval, default=True, help="set multiprocessing True/False")
 parser.add_argument('--threads', type=int, default=8, help="define number of threads")
 parser.add_argument('--keep_mesh', type=eval, default=False, help="save meshes True/False")
+parser.add_argument('--dataset', type=str, default='_bottles', help='directory housing a dataset of complete and broken .obj files') 
 opt = parser.parse_args()
 
 database = []
 multiprocess = opt.multiprocessing
 njobs = opt.threads
 keep_meshes = opt.keep_mesh
+dataset = opt.dataset
 
-
-def process_one(datapoint):
-    process_file(datapoint['complete'])
-    process_file(datapoint['broken'])
     
 
-def process_file(file_obj):
+def process_one(file_obj):
     # ---------------------------------------------
     # Create point clouds from these surface meshes
     # ---------------------------------------------
-    complete_surf = o3d.io.read_triangle_mesh(file_obj)
-    complete_pc = complete_surf.sample_points_poisson_disk(400000)
-    complete_pc_np = np.asarray(complete_pc.points)
-    complete_pc_filename = file_obj.split('.obj')[0] + '.npy'
-    np.save(complete_pc_filename, complete_pc_np)
-
+    try:
+        complete_pc_filename = file_obj.split('.obj')[0] + '.npy'
+        if os.path.exists(complete_pc_filename):
+            return
+        complete_surf = o3d.io.read_triangle_mesh(file_obj)
+        complete_pc = complete_surf.sample_points_poisson_disk(400000)
+        complete_pc_np = np.asarray(complete_pc.points)
+        np.save(complete_pc_filename, complete_pc_np)
+    except RuntimeError as e:
+        with open('preproc.log','a') as f:
+            f.write(file_obj+'\n')
 
 def main():
     directory =  os.path.join(data_dir, dataset)
     print(directory)
     # Gather available data
+    counter = 0
     for root, dirs, files in os.walk(directory, topdown=False):
-        for filename in files:
+        for filename in files[10:]:
             if filename.endswith('.obj'):
-                datapoint = {}
-                parent_dir = root.split('/complete')[0]
-                datapoint['broken'] = os.path.join(parent_dir, 'broken', filename)
-                datapoint['complete'] = os.path.join(root, filename)
-                database.append(datapoint)
-
+                counter += 1
+                if not os.path.exists(os.path.join(root, filename.split('obj')[0] + 'npy')):
+                    datapoint = ''
+                    datapoint= os.path.join(root, filename)
+                    database.append(datapoint)
+    print(f"Found {len(database) }/{counter} files unprocessed")
     if multiprocess:
         pool = multiprocessing.Pool(njobs)
         try:
@@ -71,8 +75,6 @@ def main():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        dataset = sys.argv[1]
     print(f'Preprocess {dataset} dataset ...')
     t_start = time.time()
     main()
