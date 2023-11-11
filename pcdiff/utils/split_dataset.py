@@ -17,7 +17,7 @@ if (len(completes) == 0):
     print("Error: No scans found in the specified directory. Please check the dataset path.")
     exit(0)
 
-with open(os.path.join(data_dir,  dataset+'.csv'), 'w', newline='') as file:
+with open(os.path.join(data_dir, dataset, dataset+'.csv'), 'w', newline='') as file:
     writer = csv.writer(file)
     for i in range(len(completes)):
         complete = completes[i]
