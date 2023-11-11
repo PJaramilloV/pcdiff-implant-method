@@ -6,14 +6,16 @@ from tqdm import tqdm
 import nrrd
 import time
 import csv
-
+import trimesh
+import open3d as o3d
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--multiprocessing', type=eval, default=True, help="set multiprocessing True/False")
 parser.add_argument('--threads', type=int, default=8, help="define number of threads")
 parser.add_argument('--num_points', type=int, default=30720, help="number of points the point cloud should contain")
 parser.add_argument('--num_nn', type=int, default=3072, help="number of points that represent the implant")
-parser.add_argument('--path', type=str, default='datasets/SkullBreak/skullbreak.csv')
+parser.add_argument('--dataset', type=str, default='_bottles', required=True, help="set dataset name")
+parser.add_argument('--path', type=str, default='data/pjaramil/', help="set dataset path")
 opt = parser.parse_args()
 
 multiprocess = opt.multiprocessing
@@ -39,11 +41,26 @@ def array2voxel(voxel_array):
     grid_index_array = index_voxel.T
     return grid_index_array
 
+def obj_to_numpy(file):
+    # Get the vertices of the mesh
+    mesh = trimesh.load(file)
+    vertices = mesh.vertices
+
+    # Calculate the voxel grid
+    dims = np.array((512, 512, 512))
+    voxel_grid = np.zeros(dims, dtype=bool)
+    normalized_vertices = (vertices - mesh.bounds[0]) / np.max(mesh.extents)
+    indices = (normalized_vertices * (dims - 1)).astype(int)
+
+    # Set the corresponding voxels to True
+    voxel_grid[indices[:, 0], indices[:, 1], indices[:, 2]] = True
+    return voxel_grid
+
 
 def process_one(obj):
-    pc_np = np.load(obj['defective_skull'])  # Defective skull pc
-    pc_d_np = np.load(obj['implant'])  # Implant pc
-    gt_vox, _ = nrrd.read(obj['gt_vox'])  # Gt vox
+    pc_np   = np.load(obj['broken'])  # Defective skull pc
+    pc_d_np = np.load(obj['repair'])  # Implant pc
+    gt_vox = obj_to_numpy(obj['gt_vox'])  # Gt vox
 
     # Downsample point clouds
     num_pc = pc_np.shape[0]
@@ -60,10 +77,10 @@ def process_one(obj):
     vox[gt_vox > 0] = -0.5
     vox = vox.astype(np.float32)
 
-    name_vox = os.path.join(obj['defective_skull'].split('/defective')[0], 'voxelization',
-                            obj['gt_vox'].split('.nrr')[0][-3:] + '_' + obj['defect'] + '_vox.npz')
-    name_points = os.path.join(obj['defective_skull'].split('/defective')[0], 'voxelization',
-                               obj['gt_vox'].split('.nrr')[0][-3:] + '_' + obj['defect'] + '_pc.npz')
+    path = obj['broken'].split('/broken')[0]
+    obj_name = obj['gt_vox'].split('/')[-1].split('.obj')[0]
+    name_vox = os.path.join(path, 'voxelization', obj_name + '_vox.npz')
+    name_points = os.path.join(path, 'voxelization', obj_name + '_pc.npz')
 
     # normalize pc
     max = 512.0
@@ -81,25 +98,27 @@ def main():
     print('Processing SkullBreak dataset')
     print('---------------------------------------')
 
-    dataset_folder = opt.path
-    defects = ['bilateral', 'frontoorbital', 'parietotemporal', 'random_1', 'random_2']
+    dataset_path = opt.path
+    dataset_name = opt.dataset
+    dataset_csv = os.path.join(dataset_path, dataset_name , f'{dataset_name}.csv')
+    defects = ['broken']
     database = []
 
-    if not os.path.isdir('datasets/SkullBreak/voxelization'):
-        os.makedirs('datasets/SkullBreak/voxelization')
+    vox_dir = os.path.join(dataset_path, dataset_name, 'voxelization')
+    if not os.path.isdir(vox_dir):
+        os.makedirs(vox_dir)
 
-    with open(dataset_folder, 'r') as file:
+    with open(dataset_csv, 'r') as file:
         csv_reader = csv.reader(file)
         for row in csv_reader:
-            for defect_id in range(5):
-                datapoint = dict()
-                datapoint['defective_skull'] = row[0].split('complete')[0] + 'defective_skull/' + \
-                                               defects[defect_id] + row[0].split('skull')[1].split('.')[0] + '_surf.npy'
-                datapoint['implant'] = row[0].split('complete')[0] + 'implant/' + \
-                                       defects[defect_id] + row[0].split('skull')[1].split('.')[0] + '_surf.npy'
-                datapoint['gt_vox'] = row[0]
-                datapoint['defect'] = defects[defect_id]
-                database.append(datapoint)
+            split = row[0].split('complete')
+            path = split[0]
+            file = split[1].split('.obj')[0][1:] # /file.obj
+            datapoint = dict()
+            datapoint['broken'] = os.path.join( path , 'broken' , file + '.npy')
+            datapoint['repair'] = os.path.join( path , 'repair' , file + '.npy')
+            datapoint['gt_vox'] = row[0]
+            database.append(datapoint)
 
     if multiprocess:
         # multiprocessing.set_start_method('spawn', force=True)
