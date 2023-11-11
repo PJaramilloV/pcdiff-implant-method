@@ -7,6 +7,7 @@ from model.pvcnn_completion import PVCNN2Base
 from utils.file_utils import *
 from tqdm import tqdm
 from datasets.broken_data import BrokenDataset
+
 '''
 ----- Models -----
 '''
@@ -536,6 +537,7 @@ def evaluate_recon_mvr(opt, model, save_dir):
 
         np.save(os.path.join(save_dir, name, 'input.npy'), np.asarray(data['train_points']))  # save the input points
         np.save(os.path.join(save_dir, name, 'sample.npy'), sample_np)  # save the sampled point clouds (implants)
+        #np.save(os.path.join(save_dir, name, 'difference.npy'), np.asarray(data['train_points'])-sample_np)
         np.save(os.path.join(save_dir, name, 'shift.npy'), np.asarray(data['shift']))  # save shift
         np.save(os.path.join(save_dir, name, 'scale.npy'), np.asarray(data['scale']))  # save scale
     return
@@ -577,7 +579,7 @@ def main(opt):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--path', type=str, help="set the path to the dataset here")
-    parser.add_argument('--dataset', type=str, help="specify the used dataset")
+    parser.add_argument('--dataset', type=str, help="specify the used dataset ")
     parser.add_argument('--model', default='', required=True, help="path to model to sample from")
     parser.add_argument('--num_ens', type=int, default=1, help='number of samples for ensembling')
     parser.add_argument('--sampling_method', type=str, default='ddpm', help='ddpm or ddim')

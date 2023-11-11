@@ -11,13 +11,9 @@ import sys
 
 data_dir = 'data/pjaramil/'
 
-
-
-
-
 parser = argparse.ArgumentParser()
 parser.add_argument('--multiprocessing', type=eval, default=True, help="set multiprocessing True/False")
-parser.add_argument('--threads', type=int, default=8, help="define number of threads")
+parser.add_argument('--threads', type=int, default=16, help="define number of threads")
 parser.add_argument('--keep_mesh', type=eval, default=False, help="save meshes True/False")
 parser.add_argument('--dataset', type=str, default='_bottles', help='directory housing a dataset of complete and broken .obj files') 
 opt = parser.parse_args()
@@ -27,8 +23,6 @@ multiprocess = opt.multiprocessing
 njobs = opt.threads
 keep_meshes = opt.keep_mesh
 dataset = opt.dataset
-
-    
 
 def process_one(file_obj):
     # ---------------------------------------------

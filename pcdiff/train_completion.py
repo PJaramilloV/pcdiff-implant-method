@@ -710,8 +710,9 @@ def train(gpu, opt, output_dir, noises_init):
                 map_location = {'cuda:%d' % 0: 'cuda:%d' % gpu}
                 model.load_state_dict(
                     torch.load('%s/epoch_%d.pth' % (output_dir, epoch), map_location=map_location)['model_state'])
-
-    dist.destroy_process_group()
+    
+    if opt.distribution_type == 'multi':
+        dist.destroy_process_group()
 
 
 def main():
@@ -723,8 +724,8 @@ def main():
     copy_source(__file__, output_dir)
 
     ''' Workaround '''
-    noises_init = torch.randn(570, opt.num_nn, 3)  # Init noise (num_nn random points)
-    
+    noises_init = torch.randn(1000, opt.num_nn, 3)  # Init noise (num_nn random points)
+
     if opt.dist_url == "env://" and opt.world_size == -1:
         opt.world_size = int(os.environ["WORLD_SIZE"])
 

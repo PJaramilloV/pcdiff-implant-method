@@ -11,7 +11,7 @@ parser.add_argument('--dataset', type=str, default='_bottles', help="set dataset
 opt = parser.parse_args()
 dataset = opt.dataset
 
-completes = sorted(glob.glob(os.path.join(data_dir,  dataset, '*.obj')))
+completes = sorted(glob.glob(os.path.join(data_dir,  dataset, 'complete/*.obj')))
 print(f"Found {len(completes)} {dataset} scans")
 if (len(completes) == 0):
     print("Error: No scans found in the specified directory. Please check the dataset path.")
