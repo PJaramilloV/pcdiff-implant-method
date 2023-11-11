@@ -52,7 +52,7 @@ def main():
     # Gather available data
     counter = 0
     for root, dirs, files in os.walk(directory, topdown=False):
-        for filename in files[10:]:
+        for filename in files:
             if filename.endswith('.obj'):
                 counter += 1
                 if not os.path.exists(os.path.join(root, filename.split('obj')[0] + 'npy')):

@@ -1,21 +1,87 @@
-import argparse
+import torch.multiprocessing as mp
 import torch.nn as nn
+import torch.optim as optim
 import torch.utils.data
 
+import argparse
 from torch.distributions import Normal
-from model.pvcnn_completion import PVCNN2Base
+
 from utils.file_utils import *
-from tqdm import tqdm
+from utils.visualize import *
+from model.pvcnn_completion import PVCNN2Base
+import torch.distributed as dist
 from datasets.broken_data import BrokenDataset
+
+import os
+
 '''
------ Models -----
+----- Some utilities -----
 '''
+
+
+def rotation_matrix(axis, theta):
+    """
+    Return the rotation matrix associated with counterclockwise rotation about
+    the given axis by theta radians.
+    """
+    axis = np.asarray(axis)
+    axis = axis / np.sqrt(np.dot(axis, axis))
+    a = np.cos(theta / 2.0)
+    b, c, d = -axis * np.sin(theta / 2.0)
+    aa, bb, cc, dd = a * a, b * b, c * c, d * d
+    bc, ad, ac, ab, bd, cd = b * c, a * d, a * c, a * b, b * d, c * d
+    return np.array([[aa + bb - cc - dd, 2 * (bc + ad), 2 * (bd - ac)],
+                     [2 * (bc - ad), aa + cc - bb - dd, 2 * (cd + ab)],
+                     [2 * (bd + ac), 2 * (cd - ab), aa + dd - bb - cc]])
+
+
+def rotate(vertices, faces):
+    """ vertices: [numpoints, 3] """
+    M = rotation_matrix([0, 1, 0], np.pi / 2).transpose()
+    N = rotation_matrix([1, 0, 0], -np.pi / 4).transpose()
+    K = rotation_matrix([0, 0, 1], np.pi).transpose()
+
+    v, f = vertices[:, [1, 2, 0]].dot(M).dot(N).dot(K), faces[:, [1, 2, 0]]
+    return v, f
+
+
+def norm(v, f):
+    v = (v - v.min()) / (v.max() - v.min()) - 0.5
+
+    return v, f
+
+
+def getGradNorm(net):
+    pNorm = torch.sqrt(sum(torch.sum(p ** 2) for p in net.parameters()))
+    gradNorm = torch.sqrt(sum(torch.sum(p.grad ** 2) for p in net.parameters()))
+
+    return pNorm, gradNorm
+
+
+def weights_init(m):
+    """
+    xavier initialization
+    """
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1 and m.weight is not None:
+        torch.nn.init.xavier_normal_(m.weight)
+
+    elif classname.find('BatchNorm') != -1:
+        m.weight.data.normal_()
+        m.bias.data.fill_(0)
+
+
+''' 
+----- Models ----- 
+'''
+
 
 def normal_kl(mean1, logvar1, mean2, logvar2):
     """
     KL divergence between normal distributions parameterized by mean and log-variance.
     """
-    return 0.5 * (-1.0 + logvar2 - logvar1 + torch.exp(logvar1 - logvar2) + (mean1 - mean2) ** 2 * torch.exp(-logvar2))
+    return 0.5 * (-1.0 + logvar2 - logvar1 + torch.exp(logvar1 - logvar2)
+                  + (mean1 - mean2) ** 2 * torch.exp(-logvar2))
 
 
 def discretized_gaussian_log_likelihood(x, *, means, log_scales):
@@ -33,8 +99,10 @@ def discretized_gaussian_log_likelihood(x, *, means, log_scales):
     log_one_minus_cdf_min = torch.log(torch.max(1. - cdf_min, torch.ones_like(cdf_min) * 1e-12))
     cdf_delta = cdf_plus - cdf_min
 
-    log_probs = torch.where(x < 0.001, log_cdf_plus, torch.where(x > 0.999, log_one_minus_cdf_min, torch.log(
-        torch.max(cdf_delta, torch.ones_like(cdf_delta) * 1e-12))))
+    log_probs = torch.where(
+        x < 0.001, log_cdf_plus,
+        torch.where(x > 0.999, log_one_minus_cdf_min,
+                    torch.log(torch.max(cdf_delta, torch.ones_like(cdf_delta) * 1e-12))))
     assert log_probs.shape == x.shape
     return log_probs
 
@@ -46,7 +114,7 @@ class GaussianDiffusion:
         self.model_var_type = model_var_type
         assert isinstance(betas, np.ndarray)
         self.np_betas = betas = betas.astype(np.float64)  # computations here in float64 for accuracy
-        #assert (betas > 0).all() and (betas <= 1).all()
+        assert (betas > 0).all() and (betas <= 1).all()
         timesteps, = betas.shape
         self.num_timesteps = int(timesteps)
         self.sv_points = sv_points
@@ -70,15 +138,13 @@ class GaussianDiffusion:
 
         betas = torch.from_numpy(betas).float()
         alphas = torch.from_numpy(alphas).float()
-
         # calculations for posterior q(x_{t-1} | x_t, x_0)
         posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
-
         # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
         self.posterior_variance = posterior_variance
-
         # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
-        self.posterior_log_variance_clipped = torch.log(torch.max(posterior_variance, 1e-20 * torch.ones_like(posterior_variance)))
+        self.posterior_log_variance_clipped = torch.log(
+            torch.max(posterior_variance, 1e-20 * torch.ones_like(posterior_variance)))
         self.posterior_mean_coef1 = betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod)
         self.posterior_mean_coef2 = (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod)
 
@@ -109,8 +175,8 @@ class GaussianDiffusion:
 
         assert noise.shape == x_start.shape
 
-        return (self._extract(self.sqrt_alphas_cumprod.to(x_start.device), t, x_start.shape) * x_start + self._extract(
-            self.sqrt_one_minus_alphas_cumprod.to(x_start.device), t, x_start.shape) * noise)
+        return (self._extract(self.sqrt_alphas_cumprod.to(x_start.device), t, x_start.shape) * x_start +
+                self._extract(self.sqrt_one_minus_alphas_cumprod.to(x_start.device), t, x_start.shape) * noise)
 
     def q_posterior_mean_variance(self, x_start, x_t, t):
         """ Compute the mean and variance of the diffusion posterior q(x_{t-1} | x_t, x_0) """
@@ -131,8 +197,12 @@ class GaussianDiffusion:
 
         if self.model_var_type in ['fixedsmall', 'fixedlarge']:
             # below: only log_variance is used in the KL computations
-            model_variance, model_log_variance = self.posterior_variance.to(data.device), \
-                                                 self.posterior_log_variance_clipped.to(data.device)
+            model_variance, model_log_variance = {
+                # for fixedlarge, we set the initial (log-)variance like so to get a better decoder log likelihood
+                'fixedlarge': (self.betas.to(data.device),
+                               torch.log(torch.cat([self.posterior_variance[1:2], self.betas[1:]])).to(data.device)),
+                'fixedsmall': (self.posterior_variance.to(data.device),
+                               self.posterior_log_variance_clipped.to(data.device))}[self.model_var_type]
 
             model_variance = self._extract(model_variance, t, data.shape) * torch.ones_like(model_output)
             model_log_variance = self._extract(model_log_variance, t, data.shape) * torch.ones_like(model_output)
@@ -142,6 +212,7 @@ class GaussianDiffusion:
 
         if self.model_mean_type == 'eps':
             x_recon = self._predict_xstart_from_eps(data[:, :, self.sv_points:], t=t, eps=model_output)
+
             model_mean, _, _ = self.q_posterior_mean_variance(x_start=x_recon, x_t=data[:, :, self.sv_points:], t=t)
 
         else:
@@ -158,23 +229,18 @@ class GaussianDiffusion:
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
         assert x_t.shape == eps.shape
-
         return (self._extract(self.sqrt_recip_alphas_cumprod.to(x_t.device), t, x_t.shape) * x_t -
                 self._extract(self.sqrt_recipm1_alphas_cumprod.to(x_t.device), t, x_t.shape) * eps)
 
-    def _predict_eps_from_xstart(self, x_t, t, pred_xstart):
-        return (self._extract(self.sqrt_recip_alphas_cumprod.to(x_t.device), t, x_t.shape) * x_t - pred_xstart) / \
-               self._extract(self.sqrt_recipm1_alphas_cumprod.to(x_t.device), t, x_t.shape)
-
     ''' 
-    ----- DDPM sampling ----- 
+    ----- Sampling ----- 
     '''
 
     def p_sample(self, denoise_fn, data, t, noise_fn, clip_denoised=False, return_pred_xstart=False):
         """ Sample from the model """
-        model_mean, _, model_log_variance = self.p_mean_variance(denoise_fn, data=data, t=t,
-                                                                 clip_denoised=clip_denoised, return_pred_xstart=False)
-
+        model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(denoise_fn, data=data, t=t,
+                                                                              clip_denoised=clip_denoised,
+                                                                              return_pred_xstart=True)
         noise = noise_fn(size=model_mean.shape, dtype=model_mean.dtype, device=model_mean.device)
 
         # no noise when t == 0
@@ -182,7 +248,7 @@ class GaussianDiffusion:
 
         sample = model_mean + nonzero_mask * torch.exp(0.5 * model_log_variance) * noise
         sample = torch.cat([data[:, :, :self.sv_points], sample], dim=-1)
-        return sample
+        return (sample, pred_xstart) if return_pred_xstart else sample
 
     def p_sample_loop(self, partial_x, denoise_fn, shape, device, noise_fn=torch.randn, clip_denoised=True,
                       keep_running=False):
@@ -195,8 +261,7 @@ class GaussianDiffusion:
         noise = noise_fn(size=shape, dtype=torch.float, device=device)
 
         img_t = torch.cat([partial_x, noise], dim=-1)
-
-        for t in tqdm(reversed(range(0, self.num_timesteps if not keep_running else len(self.betas))), total=1000):
+        for t in reversed(range(0, self.num_timesteps if not keep_running else len(self.betas))):
             t_ = torch.empty(shape[0], dtype=torch.int64, device=device).fill_(t)
             img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t, t=t_, noise_fn=noise_fn,
                                   clip_denoised=clip_denoised, return_pred_xstart=False)
@@ -230,59 +295,15 @@ class GaussianDiffusion:
         assert imgs[-1].shape == shape
         return imgs
 
-    '''
-    ----- DDIM sampling -----
-    '''
-    def ddim_sample(self, denoise_fn, data, t, noise_fn, clip_denoised=True, return_pred_xstart=True, eta=0.0):
-        """
-        Sample x_{t-1} from the model using DDIM.
-        Same usage as p_sample().
-        """
-        model_mean, _, _, x_start = self.p_mean_variance(denoise_fn, data=data, t=t, clip_denoised=clip_denoised,
-                                                         return_pred_xstart=return_pred_xstart)
-
-        eps = self._predict_eps_from_xstart(data[:, :, self.sv_points:], t, x_start)
-
-        alpha_bar = self._extract(self.alphas_cumprod.to(data.device), t, data.shape)
-        alpha_bar_prev = self._extract(self.alphas_cumprod_prev.to(data.device), t, data.shape)
-        sigma = (eta * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar)) * torch.sqrt(1 - alpha_bar / alpha_bar_prev))
-
-        noise = noise_fn(size=model_mean.shape, dtype=model_mean.dtype, device=model_mean.device)
-        mean_pred = (x_start * torch.sqrt(alpha_bar_prev) + torch.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps)
-        nonzero_mask = ((t != 0).float().view(-1, *([1] * (len(data.shape) - 1))))  # no noise when t == 0
-        sample = mean_pred + nonzero_mask * sigma * noise
-        sample = torch.cat([data[:, :, :self.sv_points], sample], dim=-1)
-        return sample
-
-    def ddim_sample_loop(self, partial_x, denoise_fn, shape, device, noise_fn=torch.randn, clip_denoised=True,
-                         sampling_steps=1000):
-
-        assert isinstance(shape, (tuple, list))
-        noise = noise_fn(size=shape, dtype=torch.float, device=device)
-
-        img_t = torch.cat([partial_x, noise], dim=-1)
-
-        ts = np.linspace(0, 999, sampling_steps).round().astype('int')
-        ts = np.unique(ts)[::-1]
-
-        for t in tqdm(ts):
-            t_ = torch.empty(shape[0], dtype=torch.int64, device=device).fill_(t)
-            img_t = self.ddim_sample(denoise_fn=denoise_fn, data=img_t, t=t_, noise_fn=noise_fn,
-                                     clip_denoised=clip_denoised, return_pred_xstart=True)
-
-        assert img_t[:, :, self.sv_points:].shape == shape
-        return img_t
-
-    '''
-    ----- Losses -----
+    ''' 
+    ----- Losses ----- 
     '''
 
     def _vb_terms_bpd(self, denoise_fn, data_start, data_t, t, clip_denoised: bool, return_pred_xstart: bool):
         true_mean, _, true_log_variance_clipped = self.q_posterior_mean_variance(
             x_start=data_start[:, :, self.sv_points:], x_t=data_t[:, :, self.sv_points:], t=t)
-        model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(denoise_fn, data=data_t, t=t,
-                                                                              clip_denoised=clip_denoised,
-                                                                              return_pred_xstart=True)
+        model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(
+            denoise_fn, data=data_t, t=t, clip_denoised=clip_denoised, return_pred_xstart=True)
 
         kl = normal_kl(true_mean, true_log_variance_clipped, model_mean, model_log_variance)
         kl = kl.mean(dim=list(range(1, len(model_mean.shape)))) / np.log(2.)
@@ -295,29 +316,31 @@ class GaussianDiffusion:
         assert t.shape == torch.Size([B])
 
         if noise is None:
-            noise = torch.randn(data_start[:, :, self.sv_points:].shape, dtype=data_start.dtype,
-                                device=data_start.device)
+            noise = torch.randn(data_start[:, :, self.sv_points:].shape, dtype=data_start.dtype, device=data_start.device)
 
+        # Diffuse masked points t times. Other points don't get diffused.
         data_t = self.q_sample(x_start=data_start[:, :, self.sv_points:], t=t, noise=noise)
 
         if self.loss_type == 'mse':
-            # predict the noise instead of x_start. seems to be weighted naturally like SNR
+            # Predict the noise instead of x_start. Seems to be weighted naturally like SNR.
+            # Apply network to estimate applied noise.
             eps_recon = denoise_fn(torch.cat([data_start[:, :, :self.sv_points], data_t], dim=-1), t)[:, :, self.sv_points:]
+
+            # MSE between noise and predicted noise
             losses = ((noise - eps_recon) ** 2).mean(dim=list(range(1, len(data_start.shape))))
 
         elif self.loss_type == 'kl':
-            losses = self._vb_terms_bpd(denoise_fn=denoise_fn, data_start=data_start, data_t=data_t, t=t,
-                                        clip_denoised=False, return_pred_xstart=False)
-
+            losses = self._vb_terms_bpd(
+                denoise_fn=denoise_fn, data_start=data_start, data_t=data_t, t=t, clip_denoised=False,
+                return_pred_xstart=False)
         else:
             raise NotImplementedError(self.loss_type)
 
         assert losses.shape == torch.Size([B])
-
         return losses
 
-    '''
-    ----- Debug -----
+    ''' 
+    ----- Debug ----- 
     '''
 
     def _prior_bpd(self, x_start):
@@ -326,8 +349,8 @@ class GaussianDiffusion:
             B, T = x_start.shape[0], self.num_timesteps
             t_ = torch.empty(B, dtype=torch.int64, device=x_start.device).fill_(T - 1)
             qt_mean, _, qt_log_variance = self.q_mean_variance(x_start, t=t_)
-            kl_prior = normal_kl(mean1=qt_mean, logvar1=qt_log_variance, mean2=torch.tensor([0.]).to(qt_mean),
-                                 logvar2=torch.tensor([0.]).to(qt_log_variance))
+            kl_prior = normal_kl(mean1=qt_mean, logvar1=qt_log_variance,
+                                 mean2=torch.tensor([0.]).to(qt_mean), logvar2=torch.tensor([0.]).to(qt_log_variance))
             assert kl_prior.shape == x_start.shape
             return kl_prior.mean(dim=list(range(1, len(kl_prior.shape)))) / np.log(2.)
 
@@ -343,30 +366,36 @@ class GaussianDiffusion:
                 data_t = torch.cat(
                     [x_start[:, :, :self.sv_points], self.q_sample(x_start=x_start[:, :, self.sv_points:], t=t_b)],
                     dim=-1)
+
                 new_vals_b, pred_xstart = self._vb_terms_bpd(denoise_fn, data_start=x_start, data_t=data_t, t=t_b,
                                                              clip_denoised=clip_denoised, return_pred_xstart=True)
 
                 # MSE for progressive prediction loss
                 assert pred_xstart.shape == x_start[:, :, self.sv_points:].shape
+
                 new_mse_b = ((pred_xstart - x_start[:, :, self.sv_points:]) ** 2).mean(
                     dim=list(range(1, len(pred_xstart.shape))))
+
                 assert new_vals_b.shape == new_mse_b.shape == torch.Size([B])
 
                 # Insert the calculated term into the tensor of all terms
                 mask_bt = t_b[:, None] == torch.arange(T, device=t_b.device)[None, :].float()
                 vals_bt_ = vals_bt_ * (~mask_bt) + new_vals_b[:, None] * mask_bt
                 mse_bt_ = mse_bt_ * (~mask_bt) + new_mse_b[:, None] * mask_bt
+
                 assert mask_bt.shape == vals_bt_.shape == vals_bt_.shape == torch.Size([B, T])
 
             prior_bpd_b = self._prior_bpd(x_start[:, :, self.sv_points:])
             total_bpd_b = vals_bt_.sum(dim=1) + prior_bpd_b
-            assert vals_bt_.shape == mse_bt_.shape == torch.Size(
-                [B, T]) and total_bpd_b.shape == prior_bpd_b.shape == torch.Size([B])
+
+            assert vals_bt_.shape == mse_bt_.shape == torch.Size([B, T]) and \
+                   total_bpd_b.shape == prior_bpd_b.shape == torch.Size([B])
+
             return total_bpd_b.mean(), vals_bt_.mean(), prior_bpd_b.mean(), mse_bt_.mean()
 
 
 class PVCNN2(PVCNN2Base):
-    num_n = 128
+    num_n = 128 # Number of neighbors
 
     # Define set abstraction layers
     sa_blocks = [((32, 2, 32), (10240, 0.1, num_n, (32, 64))),
@@ -394,30 +423,12 @@ class Model(nn.Module):
                  width_mult: float, vox_res_mult: float):
         super(Model, self).__init__()
 
-        # Create diffusion (DDPM)
+        # Create diffusion
         self.diffusion = GaussianDiffusion(betas, loss_type, model_mean_type, model_var_type,
-                                           sv_points=(args.num_points-args.num_nn))
-
-        # Create diffusion (DDIM)
-        if args.sampling_method == 'ddim':
-            timesteps = np.linspace(0, args.time_num-1, args.sampling_steps).round().astype('int')
-            timesteps = np.unique(timesteps)[::-1]
-            timesteps = set(timesteps)
-
-            last_alpha_cumprod = 1.0
-            new_betas = []
-            for i, alpha_cumprod in enumerate(self.diffusion.alphas_cumprod):
-                if i in timesteps:
-                    new_betas.append(1 - alpha_cumprod / last_alpha_cumprod)
-                    last_alpha_cumprod = alpha_cumprod
-                else:
-                    new_betas.append(0.0)
-            new_betas = np.array(new_betas)
-            self.diffusion = GaussianDiffusion(new_betas, loss_type, model_mean_type, model_var_type,
-                                               sv_points=(args.num_points-args.num_nn))
+                                           sv_points=(args.num_points - args.num_nn))
 
         # Create point-voxel-cnn network
-        self.model = PVCNN2(num_classes=args.nc, sv_points=(args.num_points-args.num_nn), embed_dim=args.embed_dim,
+        self.model = PVCNN2(num_classes=args.nc, sv_points=(args.num_points - args.num_nn), embed_dim=args.embed_dim,
                             use_att=args.attention, dropout=args.dropout, extra_feature_channels=0,
                             width_multiplier=width_mult, voxel_resolution_multiplier=vox_res_mult)
 
@@ -443,27 +454,22 @@ class Model(nn.Module):
 
     def get_loss_iter(self, data, noises=None):
         B, D, N = data.shape
+
+        # Sample random time t step for training
         t = torch.randint(0, self.diffusion.num_timesteps, size=(B,), device=data.device)
 
         if noises is not None:
             noises[t != 0] = torch.randn((t != 0).sum(), *noises.shape[1:]).to(noises)
 
+        # Compute training loss
         losses = self.diffusion.p_losses(denoise_fn=self._denoise, data_start=data, t=t, noise=noises)
+
         assert losses.shape == t.shape == torch.Size([B])
         return losses
 
-    def gen_samples(self, partial_x, shape, device, noise_fn=torch.randn, clip_denoised=True, keep_running=False,
-                    sampling_method='ddpm', sampling_steps=1000):
-        if sampling_method == 'ddpm':
-            return self.diffusion.p_sample_loop(partial_x, self._denoise, shape=shape, device=device, noise_fn=noise_fn,
-                                                clip_denoised=clip_denoised, keep_running=keep_running)
-        if sampling_method == 'ddim':
-            return self.diffusion.ddim_sample_loop(partial_x, self._denoise, shape=shape, device=device,
-                                                   noise_fn=noise_fn, clip_denoised=clip_denoised,
-                                                   sampling_steps=sampling_steps)
-        else:
-            raise NotImplementedError("Not implemented. Use 'ddpm' or 'ddim'.")
-
+    def gen_samples(self, partial_x, shape, device, noise_fn=torch.randn, clip_denoised=True, keep_running=False):
+        return self.diffusion.p_sample_loop(partial_x, self._denoise, shape=shape, device=device, noise_fn=noise_fn,
+                                            clip_denoised=clip_denoised, keep_running=keep_running)
 
     def train(self):
         self.model.train()
@@ -500,107 +506,261 @@ def get_betas(schedule_type, b_start, b_end, time_num):
     return betas
 
 
-#############################################################################
-def get_dataset(path, num_points, num_nn, dataset):
-    te_dataset = BrokenDataset(path=path, num_points=num_points, num_nn=num_nn, norm_mode='shape_bbox',
-                                       eval=True)
-    return te_dataset
+def get_dataset(num_points, num_nn, path, dataset, augment):
+    tr_dataset = BrokenDataset(path=path, num_points=num_points, num_nn=num_nn, norm_mode='shape_bbox',
+                                       augment=augment)
+    return tr_dataset
 
 
-def evaluate_recon_mvr(opt, model, save_dir):
-    test_dataset = get_dataset(opt.path, opt.num_points, opt.num_nn, opt.dataset)
-    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=opt.bs, shuffle=False,
-                                                  num_workers=int(opt.workers), drop_last=False)
+def get_dataloader(opt, train_dataset, test_dataset=None):
+    if opt.distribution_type == 'multi':
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_dataset,
+            num_replicas=opt.world_size,
+            rank=opt.rank)
 
-    model.eval()
+        if test_dataset is not None:
+            test_sampler = torch.utils.data.distributed.DistributedSampler(
+                test_dataset,
+                num_replicas=opt.world_size,
+                rank=opt.rank)
+        else:
+            test_sampler = None
 
-    for i, data in tqdm(enumerate(test_dataloader), total=len(test_dataloader), desc='Reconstructing Samples'):
-        pc = data['train_points'].transpose(1, 2).to("cuda:" + str(opt.gpu))
-        name = (data['name'][0].split('/')[-2] + data['name'][0].split('/')[-1].split('.')[0])
+    else:
+        train_sampler = None
+        test_sampler = None
 
-        ensemble_num = opt.num_ens
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.bs, sampler=train_sampler,
+                                                   shuffle=train_sampler is None, num_workers=int(opt.workers),
+                                                   drop_last=True)
 
-        pc = pc.repeat(ensemble_num, 1, 1)
-        noise_shape = torch.Size([ensemble_num, 3, opt.num_nn])
+    if test_dataset is not None:
+        test_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.bs, sampler=test_sampler,
+                                                      shuffle=False, num_workers=int(opt.workers), drop_last=False)
+    else:
+        test_dataloader = None
 
-        with torch.no_grad():
-            sample = model.gen_samples(pc, noise_shape, pc.device, clip_denoised=False,
-                                       sampling_method=opt.sampling_method, sampling_steps=opt.sampling_steps)
-            sample = sample.detach().cpu()
-
-        sample_np = np.asarray(sample)
-        sample_np = sample_np.transpose(0, 2, 1)
-
-        if not (os.path.exists(os.path.join(save_dir, name))):
-            os.mkdir(os.path.join(save_dir, name))
-
-        np.save(os.path.join(save_dir, name, 'input.npy'), np.asarray(data['train_points']))  # save the input points
-        np.save(os.path.join(save_dir, name, 'sample.npy'), sample_np)  # save the sampled point clouds (implants)
-        np.save(os.path.join(save_dir, name, 'shift.npy'), np.asarray(data['shift']))  # save shift
-        np.save(os.path.join(save_dir, name, 'scale.npy'), np.asarray(data['scale']))  # save scale
-    return
+    return train_dataloader, test_dataloader, train_sampler, test_sampler
 
 
-def main(opt):
-    output_dir = opt.eval_path
-    if not os.path.isdir(output_dir):
-        os.makedirs(output_dir)
-
+def train(gpu, opt, output_dir, noises_init):
     logger = setup_logging(output_dir)
-    outf_syn, = setup_output_subdirs(output_dir, 'syn')
 
+    if opt.distribution_type == 'multi':
+        should_diag = gpu == 0
+
+    else:
+        should_diag = True
+
+    if should_diag:
+        outf_syn, = setup_output_subdirs(output_dir, 'syn')
+
+    if opt.distribution_type == 'multi':
+        if opt.dist_url == "env://" and opt.rank == -1:
+            opt.rank = int(os.environ["RANK"])
+
+        base_rank = opt.rank * opt.ngpus_per_node
+        opt.rank = base_rank + gpu
+        dist.init_process_group(backend=opt.dist_backend, init_method=opt.dist_url,
+                                world_size=opt.world_size, rank=opt.rank)
+
+        opt.bs = int(opt.bs / opt.ngpus_per_node)
+        opt.workers = 0
+
+        opt.saveIter = int(opt.saveIter / opt.ngpus_per_node)
+        opt.diagIter = int(opt.diagIter / opt.ngpus_per_node)
+        opt.vizIter = int(opt.vizIter / opt.ngpus_per_node)
+
+    ''' Dataset and data loader '''
+    train_dataset = get_dataset(opt.num_points, opt.num_nn, opt.path, opt.dataset, opt.augment)
+    dataloader, _, train_sampler, _ = get_dataloader(opt, train_dataset, None)
+
+    ''' Create networks '''
     betas = get_betas(opt.schedule_type, opt.beta_start, opt.beta_end, opt.time_num)
-    model = Model(opt, betas, opt.loss_type, opt.model_mean_type, opt.model_var_type, width_mult=opt.width_mult,
-                  vox_res_mult=opt.vox_res_mult)
+    model = Model(opt, betas, opt.loss_type, opt.model_mean_type, opt.model_var_type, opt.width_mult, opt.vox_res_mult)
 
-    def _transform_(m):
-        return nn.parallel.DataParallel(m)
+    if opt.distribution_type == 'multi':  # Multiple processes, single GPU per process
+        def _transform_(m):
+            return nn.parallel.DistributedDataParallel(
+                m, device_ids=[gpu], output_device=gpu)
 
-    torch.cuda.set_device(opt.gpu)
-    model = model.cuda(opt.gpu)
-
-    if opt.distr_train:
+        torch.cuda.set_device(gpu)
+        model.cuda(gpu)
         model.multi_gpu_wrapper(_transform_)
 
-    model.eval()
+    elif opt.distribution_type == 'single':
+        def _transform_(m):
+            return nn.parallel.DataParallel(m)
 
-    with torch.no_grad():
-        logger.info("Perform sampling with:%s" % opt.model)
+        model = model.cuda()
+        model.multi_gpu_wrapper(_transform_)
 
-        resumed_param = torch.load(opt.model, map_location=("cuda:" + str(opt.gpu)))
-        model.load_state_dict(resumed_param['model_state'])
+    elif gpu is not None:
+        "Set GPU"
+        torch.cuda.set_device(gpu)
+        model = model.cuda(gpu)
 
-        if opt.eval_recon_mvr:
-            # Evaluate generation
-            evaluate_recon_mvr(opt, model, outf_syn)
+    else:
+        raise ValueError('distribution_type = multi | single | None')
+
+    if should_diag:
+        logger.info(opt)
+
+    optimizer = optim.Adam(model.parameters(), lr=opt.lr, weight_decay=opt.decay, betas=(opt.beta1, 0.999))
+    lr_scheduler = optim.lr_scheduler.ExponentialLR(optimizer, opt.lr_gamma)
+
+    if opt.model != '':
+        ckpt = torch.load(opt.model)
+        model.load_state_dict(ckpt['model_state'])
+        optimizer.load_state_dict(ckpt['optimizer_state'])
+
+    if opt.model != '':
+        start_epoch = torch.load(opt.model)['epoch'] + 1
+
+    else:
+        start_epoch = 0
+
+    # Training loop
+    for epoch in range(start_epoch, opt.niter):
+        if opt.distribution_type == 'multi':
+            train_sampler.set_epoch(epoch)
+
+        for i, data in enumerate(dataloader):
+            pc_in = data['train_points'].transpose(1, 2)  # Input point cloud
+            noises_batch = noises_init[data['idx']].transpose(1, 2)  # Noise (num_nn points)
+
+            pc_in = pc_in.cuda(gpu)
+            noises_batch = noises_batch.cuda(gpu)
+
+            # Compute training loss
+            loss = model.get_loss_iter(pc_in, noises_batch).mean()
+
+            # Optimize network parameters
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # Print progress
+            if i % opt.print_freq == 0 and should_diag:
+                logger.info('[{:>3d}/{:>3d}][{:>3d}/{:>3d}]    loss: {:>10.4f},    '
+                            .format(epoch, opt.niter, i, len(dataloader), loss.item()))
+        lr_scheduler.step()
+
+        # Evaluate
+        if (epoch + 1) % opt.diagIter == 0 and should_diag:
+            logger.info('Diagnosis:')
+
+            x_range = [pc_in.min().item(), pc_in.max().item()]
+            kl_stats = model.all_kl(pc_in)
+            logger.info('      [{:>3d}/{:>3d}]    '
+                        'x_range: [{:>10.4f}, {:>10.4f}],   '
+                        'total_bpd_b: {:>10.4f},    '
+                        'terms_bpd: {:>10.4f},  '
+                        'prior_bpd_b: {:>10.4f}    '
+                        'mse_bt: {:>10.4f}  '
+                        .format(epoch, opt.niter,
+                                *x_range,
+                                kl_stats['total_bpd_b'].item(),
+                                kl_stats['terms_bpd'].item(), kl_stats['prior_bpd_b'].item(),
+                                kl_stats['mse_bt'].item()))
+
+        # Visualize some samples
+        if (epoch + 1) % opt.vizIter == 0 and should_diag:
+            logger.info('Generation: eval')
+
+            model.eval()
+
+            with torch.no_grad():
+                x_gen_eval = model.gen_samples(pc_in[:, :, :(opt.num_points - opt.num_nn)],
+                                               pc_in[:, :, (opt.num_points - opt.num_nn):].shape,
+                                               pc_in.device, clip_denoised=False).detach().cpu()
+
+                gen_stats = [x_gen_eval.mean(), x_gen_eval.std()]
+                gen_eval_range = [x_gen_eval.min().item(), x_gen_eval.max().item()]
+
+                logger.info('      [{:>3d}/{:>3d}]  '
+                            'eval_gen_range: [{:>10.4f}, {:>10.4f}]     '
+                            'eval_gen_stats: [mean={:>10.4f}, std={:>10.4f}]      '
+                            .format(epoch, opt.niter, *gen_eval_range, *gen_stats))
+
+            # Save samples and ground truth
+            export_to_pc_batch('%s/epoch_%03d_samples_eval' % (outf_syn, epoch),
+                               (x_gen_eval.transpose(1, 2)).numpy())
+
+            export_to_pc_batch('%s/epoch_%03d_ground_truth' % (outf_syn, epoch),
+                               (pc_in.transpose(1, 2).detach().cpu()).numpy())
+
+            export_to_pc_batch('%s/epoch_%03d_partial' % (outf_syn, epoch),
+                               (pc_in[:, :, :(opt.num_points - opt.num_nn)].transpose(1, 2).detach().cpu()).numpy())
+
+            model.train()
+
+        if (epoch + 1) % opt.saveIter == 0:
+            if should_diag:
+                save_dict = {'epoch': epoch,
+                             'model_state': model.state_dict(),
+                             'optimizer_state': optimizer.state_dict()
+                             }
+
+                torch.save(save_dict, '%s/epoch_%d.pth' % (output_dir, epoch))
+
+            if opt.distribution_type == 'multi':
+                dist.barrier()
+                map_location = {'cuda:%d' % 0: 'cuda:%d' % gpu}
+                model.load_state_dict(
+                    torch.load('%s/epoch_%d.pth' % (output_dir, epoch), map_location=map_location)['model_state'])
+
+    dist.destroy_process_group()
+
+
+def main():
+    opt = parse_args()
+
+    exp_id = os.path.splitext(os.path.basename(__file__))[0]
+    dir_id = os.path.dirname(__file__)
+    output_dir = get_output_dir(dir_id, exp_id)
+    copy_source(__file__, output_dir)
+
+    ''' Workaround '''
+    noises_init = torch.randn(570, opt.num_nn, 3)  # Init noise (num_nn random points)
+    
+    if opt.dist_url == "env://" and opt.world_size == -1:
+        opt.world_size = int(os.environ["WORLD_SIZE"])
+
+    if opt.distribution_type == 'multi':
+        opt.ngpus_per_node = torch.cuda.device_count()
+        opt.world_size = opt.ngpus_per_node * opt.world_size
+        mp.spawn(train, nprocs=opt.ngpus_per_node, args=(opt, output_dir, noises_init))
+
+    else:
+        train(opt.gpu, opt, output_dir, noises_init)
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--path', type=str, help="set the path to the dataset here")
-    parser.add_argument('--dataset', type=str, help="specify the used dataset")
-    parser.add_argument('--model', default='', required=True, help="path to model to sample from")
-    parser.add_argument('--num_ens', type=int, default=1, help='number of samples for ensembling')
-    parser.add_argument('--sampling_method', type=str, default='ddpm', help='ddpm or ddim')
-    parser.add_argument('--sampling_steps', type=int, default=1000)
+    parser.add_argument('--path', type=str, required=True, help="set the path to the dataset here")
+    parser.add_argument('--dataset', type=str, required=False, help="specify the used dataset")
 
-    parser.add_argument('--bs', type=int, default=1, help='input batch size')
-    parser.add_argument('--workers', type=int, default=24, help='workers')
-    parser.add_argument('--niter', type=int, default=100000, help='number of epochs to train for')  # not used
+    # Data loader parameters
+    parser.add_argument('--bs', type=int, default=8, help='input batch size')
+    parser.add_argument('--workers', type=int, default=24, help='workers dataloader')
+    parser.add_argument('--niter', type=int, default=15000, help='number of epochs to train for')
 
-    parser.add_argument('--eval_recon_mvr', type=eval, default=True)
-    parser.add_argument('--eval_saved', type=eval, default=True)
-
+    # Input point cloud
     parser.add_argument('--nc', type=int, default=3, help="dimension of one point (usually 3 for x, y,z)")
     parser.add_argument('--num_points', type=int, default=30720, help="number of points the point cloud should contain")
     parser.add_argument('--num_nn', type=int, default=3072, help="number of points that represent the implant")
 
-    '''model'''
+    ''' Model '''
+    # Diffusion process parameters (variance schedule, number of steps)
     parser.add_argument('--beta_start', type=float, default=0.0001)
     parser.add_argument('--beta_end', type=float, default=0.02)
     parser.add_argument('--schedule_type', type=str, default='linear')
-    parser.add_argument('--time_num', type=int, default=1000)
+    parser.add_argument('--time_num', type=int, default=1000, help='number of timesteps T in diffusion process')
+    parser.add_argument('--augment', type=eval, default=False, help='apply random rotation (+-10deg) around all axes')
 
-    # params
+    # Model parameters
     parser.add_argument('--attention', type=eval, default=True)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--embed_dim', type=int, default=64)
@@ -609,24 +769,45 @@ def parse_args():
     parser.add_argument('--model_var_type', type=str, default='fixedsmall')
     parser.add_argument('--vox_res_mult', type=float, default=1.0)
     parser.add_argument('--width_mult', type=float, default=1.0)
-    parser.add_argument('--distr_train', type=eval, default=False)
 
-    '''eval'''
-    parser.add_argument('--eval_path', default='', required=True, help='set manual path to save the results')
-    parser.add_argument('--manualSeed', default=48, type=int, help='random seed')
+    parser.add_argument('--lr', type=float, default=2e-4, help='learning rate for E, default=0.0002')
+    parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam. default=0.5')
+    parser.add_argument('--decay', type=float, default=0, help='weight decay for EBM')
+    parser.add_argument('--grad_clip', type=float, default=None, help='weight decay for EBM')
+    parser.add_argument('--lr_gamma', type=float, default=1, help='lr decay for EBM')
+
+    # Model path (for continuing the training of existing models)
+    parser.add_argument('--model', default='', help="path to model (to continue training)")
+
+    ''' Distributed training environment '''
+    # The distributed training environment was not tested. We can not ensure that it works properly.
+    parser.add_argument('--world_size', default=1, type=int, help='Number of distributed nodes.')
+    parser.add_argument('--dist_url', default='tcp://127.0.0.1:9991', type=str,
+                        help='url used to set up distributed training')
+    parser.add_argument('--dist_backend', default='nccl', type=str, help='distributed backend')
+    parser.add_argument('--distribution_type', default=None, choices=['multi', 'single', None],
+                        help='Use multi-processing distributed training to launch '
+                             'N processes per node, which has N GPUs. This is the '
+                             'fastest way to use PyTorch for either single node or '
+                             'multi node data parallel training')
+    parser.add_argument('--rank', default=0, type=int, help='node rank for distributed training')
+
     parser.add_argument('--gpu', default=0, type=int, help='GPU id to use. None means using all available GPUs.')
 
-    opt = parser.parse_args()
+    ''' Evaluation '''
+    parser.add_argument('--saveIter', type=int, default=1000, help='unit: epoch')
+    parser.add_argument('--diagIter', type=int, default=1000, help='unit: epoch')
+    parser.add_argument('--vizIter', type=int, default=1000, help='unit: epoch')
+    parser.add_argument('--print_freq', type=int, default=2, help='unit: iter')
 
-    if torch.cuda.is_available():
-        opt.cuda = True
-    else:
-        opt.cuda = False
+    # Manual seed for deterministic sampling, etc.
+    parser.add_argument('--manualSeed', default=1234, type=int, help='random seed')
+
+    # Parse arguments
+    opt = parser.parse_args()
 
     return opt
 
 
 if __name__ == '__main__':
-    opt = parse_args()
-
-    main(opt)
+    main()

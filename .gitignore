@@ -5,6 +5,7 @@
 *.npy
 *.npz
 *.obj
+*.zip
 
 # Model output
 /pcdiff/output

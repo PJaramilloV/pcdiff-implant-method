@@ -26,8 +26,8 @@ class BrokenDataset(th.utils.data.Dataset):
             for row in csv_reader:
                 datapoint = dict()
                 path, obj = row[0].split('complete')
-                datapoint['broken'] = path + 'broken' + obj.split('.')[0] + '_surf.npy'
-                datapoint['repair'] = path + 'repair' + obj.split('.')[0] + '_surf.npy'
+                datapoint['broken'] = path + 'broken' + obj.split('.')[0] + '.npy'
+                datapoint['repair'] = path + 'repair' + obj.split('.')[0] + '.npy'
                 self.database.append(datapoint)
 
     def __getitem__(self, file):
