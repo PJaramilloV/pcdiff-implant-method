@@ -1,6 +1,6 @@
 
 from src.data.core import (
-    Shapes3dDataset, SkullDataset, collate_remove_none, worker_init_fn, collate_stack_together, SkullEval
+    Shapes3dDataset, ObjectDataset, collate_remove_none, worker_init_fn, collate_stack_together, ObjectEval
 )
 from src.data.fields import (
     IndexField, PointCloudField, FullPSRField

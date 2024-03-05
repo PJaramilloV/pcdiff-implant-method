@@ -575,9 +575,11 @@ def initialize_logger(cfg):
     ch = logging.StreamHandler()
     logger.addHandler(ch)
     # Log to file
-    fh = logging.FileHandler(os.path.join(cfg['train']['out_dir'], "log.txt"))
+    fh = logging.FileHandler(os.path.join(cfg['train']['out_dir'], "log.log"))
     logger.addHandler(fh)
     logger.info('Outout dir: %s', out_dir)
+    # print working dir
+    logger.info('Working dir: %s', os.getcwd())
     return logger
 
 def update_recursive(dict1, dict2):
