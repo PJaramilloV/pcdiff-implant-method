@@ -10,8 +10,9 @@ from src import config
 from src.model import Encode2Points
 from src.data.core import ObjectEval
 from src.utils import load_config, load_model_manual, readCT, crop, padding, reverse_padding, reverse_crop, \
-    re_sample_shape
+    re_sample_shape, filter_voxels_within_radius
 from tqdm import tqdm
+from scipy import ndimage
 
 np.set_printoptions(precision=4)
 
@@ -92,6 +93,7 @@ def main():
                 psr_grid = psr_grid[0, :, :, :]
                 out = np.zeros((512, 512, 512))
                 out[psr_grid <= 0] = 1
+                out = ndimage.binary_dilation(out)
 
                 completes += out  # Add to implant ensemble
 
@@ -106,20 +108,19 @@ def main():
                     out = dip.Label(out, mode='largest')
                     out = np.asarray(out, dtype=np.float32)
 
-                    if cfg['data']['dset'] == 'SkullFix':
-                        util, header = nrrd.read(os.path.join(name.split('/results')[0], 'broken',
-                                                              name.split('_surf')[0][-3:] + '.nrrd'))
-                        out = reverse_padding(out, dim_x, dim_y, dim_z)
-                        out = reverse_crop(out, idx_x, idx_y, idx_z, shape)
+                    # if cfg['data']['dset'] == 'SkullFix':
+                    #     util, header = nrrd.read(os.path.join(name.split('/results')[0], 'broken',
+                    #                                           name.split('_surf')[0][-3:] + '.nrrd'))
+                    #     out = reverse_padding(out, dim_x, dim_y, dim_z)
+                    #     out = reverse_crop(out, idx_x, idx_y, idx_z, shape)
 
-                        new_shape = np.asarray(util.shape)
-                        out_re, _ = re_sample_shape(out, [0.45, 0.45, 0.45], new_shape)
-                        im = np.zeros(out_re.shape)
-                        im[out_re > 0.5] = 1
-                        nrrd.write(str(name + '/impl_' + str(pc) + '.nrrd'), im, header)
+                    #     new_shape = np.asarray(util.shape)
+                    #     out_re, _ = re_sample_shape(out, [0.45, 0.45, 0.45], new_shape)
+                    #     im = np.zeros(out_re.shape)
+                    #     im[out_re > 0.5] = 1
+                    #     nrrd.write(str(name + '/impl_' + str(pc) + '.nrrd'), im, header)
 
-                    if cfg['data']['dset'] == 'SkullBreak':
-                        nrrd.write(str(name + '/impl_' + str(pc) + '.nrrd'), out, header)
+                    nrrd.write(str(name + '/impl_' + str(pc) + '.nrrd'), out, header)
 
         # Performs generation without ensembling
         else:
@@ -131,6 +132,7 @@ def main():
             psr_grid = psr_grid[0, :, :, :]
             out = np.zeros((512, 512, 512))
             out[psr_grid <= 0] = 1
+            out = ndimage.binary_dilation(out)
 
             completes += out  # Add to implant ensemble
 
@@ -139,14 +141,15 @@ def main():
         mean_complete[completes >= np.ceil(cfg['generation']['num_ensemble']/2)] = 1
 
         mean_implant = mean_complete - defective_shape
+        mean_implant = filter_voxels_within_radius(inputs[0, 30720-3072:, :], mean_implant)
         mean_implant = mean_implant.astype(bool)
         mean_implant = dip.Opening(mean_implant, dip.SE((3, 3, 3)))
-        mean_implant = dip.Opening(mean_implant, dip.SE((3, 3, 3)))
+        #mean_implant = dip.Opening(mean_implant, dip.SE((3, 3, 3)))
         mean_implant = dip.Label(mean_implant, mode="largest")
         mean_implant = dip.MedianFilter(mean_implant, dip.Kernel(shape='rectangular', param=(3, 3, 3)))
         mean_implant.Convert('BIN')
         mean_implant = dip.Closing(mean_implant, dip.SE((3, 3, 3)))
-        mean_implant = dip.Closing(mean_implant, dip.SE((3, 3, 3)))
+        #mean_implant = dip.Closing(mean_implant, dip.SE((3, 3, 3)))
         mean_implant = dip.FillHoles(mean_implant)
 
         if cfg['data']['dset'] == 'SkullBreak':
