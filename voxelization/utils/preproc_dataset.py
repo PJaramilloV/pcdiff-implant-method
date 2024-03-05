@@ -3,11 +3,10 @@ import argparse
 import multiprocessing
 import numpy as np
 from tqdm import tqdm
-import nrrd
 import time
 import csv
 import trimesh
-import open3d as o3d
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--multiprocessing', type=eval, default=True, help="set multiprocessing True/False")
@@ -42,27 +41,57 @@ def array2voxel(voxel_array):
     return grid_index_array
 
 def obj_to_numpy(file):
-    # Get the vertices of the mesh
     mesh = trimesh.load(file)
+
+    # Get the vertices of the mesh
     vertices = mesh.vertices
 
+    # Choose the dimensions of the voxel grid
+    dims = (512, 512, 512)
+    dims = np.array(dims)
+
     # Calculate the voxel grid
-    dims = np.array((512, 512, 512))
     voxel_grid = np.zeros(dims, dtype=bool)
+
+    # Normalize vertices to be in the range [0, 1] within the voxel grid
     normalized_vertices = (vertices - mesh.bounds[0]) / np.max(mesh.extents)
+
+    # Calculate voxel indices
     indices = (normalized_vertices * (dims - 1)).astype(int)
 
     # Set the corresponding voxels to True
     voxel_grid[indices[:, 0], indices[:, 1], indices[:, 2]] = True
+
     return voxel_grid
+
+def obj_to_vox(file):
+    mesh:trimesh.Trimesh = trimesh.load(file)
+    grid_size = 512
+    grid_size_arr = np.array((grid_size, grid_size, grid_size))
+
+    # voxelize mesh into matrix
+    max_size = np.max(mesh.extents)
+    scaling = max_size/(grid_size - 6)
+
+    vox:trimesh.voxel.VoxelGrid = mesh.voxelized(scaling)
+    voxel_grid = vox.matrix
+    voxel_grid_shape = np.array(voxel_grid.shape)
+
+    # pad to final size
+    pad_x, pad_y, pad_z = (grid_size_arr - voxel_grid_shape) // 2
+    fix_x, fix_y, fix_z = grid_size_arr - voxel_grid_shape - 2*np.array((pad_x, pad_y, pad_z))
+    vox_out = np.pad(voxel_grid, 
+                     ((pad_x, pad_x+fix_x),(pad_y, pad_y+fix_y),(pad_z, pad_z+fix_z)),
+                     mode='constant', constant_values=0)
+    return vox_out
 
 
 def process_one(obj):
     pc_np   = np.load(obj['broken'])  # Defective skull pc
     pc_d_np = np.load(obj['repair'])  # Implant pc
-    gt_vox = obj_to_numpy(obj['gt_vox'])  # Gt vox
+    gt_vox = obj_to_vox(obj['gt_vox'])  # Gt vox
 
-    # Downsample point clouds
+    # Downsample point clouds, broken and desired repair
     num_pc = pc_np.shape[0]
     idx_pc = np.random.randint(0, num_pc, num_points - num_nn)
     pc_np = pc_np[idx_pc, :]
@@ -72,19 +101,31 @@ def process_one(obj):
     pc_d_np = pc_d_np[idx_pc_d, :]
 
     points = np.concatenate((pc_np, pc_d_np), axis=0)  # Pc complete (defective skull + implant)
+    
+    # normalize pc
+    max_val = np.max(points)
+    min_val = np.min(points)
+    points = (points - min_val / max_val - min_val) *0.85
 
+    # center pointcloud on x-y with z floored
+    min_x, max_x = np.min(points[:, 0]), np.max(points[:, 0])
+    min_y, max_y = np.min(points[:, 1]), np.max(points[:, 1])
+    min_z= np.min(points[:, 2])
+    
+    pad_x = 1 - max_x + min_x
+    pad_y = 1 - max_y + min_y
+    points += np.array((pad_x/2 - min_x, pad_y/2 - min_y, -min_z))
+
+    # create voxel representation of gt
     vox = np.ones((512, 512, 512), dtype=bool) * 0.5
     vox[gt_vox > 0] = -0.5
     vox = vox.astype(np.float32)
 
+    # save
     path = obj['broken'].split('/broken')[0]
     obj_name = obj['gt_vox'].split('/')[-1].split('.obj')[0]
     name_vox = os.path.join(path, 'voxelization', obj_name + '_vox.npz')
     name_points = os.path.join(path, 'voxelization', obj_name + '_pc.npz')
-
-    # normalize pc
-    max = 512.0
-    points /= max
 
     if save_pointcloud:
         np.savez_compressed(name_points, points=points)
@@ -94,12 +135,13 @@ def process_one(obj):
 
 def main():
 
-    print('---------------------------------------')
-    print('Processing SkullBreak dataset')
-    print('---------------------------------------')
-
     dataset_path = opt.path
     dataset_name = opt.dataset
+
+    print('---------------------------------------')
+    print(f'Processing {dataset_name} dataset')
+    print('---------------------------------------')
+    
     dataset_csv = os.path.join(dataset_path, dataset_name , f'{dataset_name}.csv')
     defects = ['broken']
     database = []

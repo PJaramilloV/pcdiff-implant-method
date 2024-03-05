@@ -8,7 +8,7 @@ import yaml
 from eval_metrics import bdc, dc, hd95
 from src import config
 from src.model import Encode2Points
-from src.data.core import SkullEval
+from src.data.core import ObjectEval
 from src.utils import load_config, load_model_manual, readCT, crop, padding, reverse_padding, reverse_crop, \
     re_sample_shape
 from tqdm import tqdm
@@ -44,7 +44,7 @@ def main():
     # PYTORCH VERSION > 1.0.0
     assert(float(torch.__version__.split('.')[-3]) > 0)
 
-    dataset = SkullEval(cfg['data']['path'])
+    dataset = ObjectEval(cfg['data']['path'])
     test_loader = torch.utils.data.DataLoader(dataset, batch_size=1, num_workers=0, shuffle=False)
     model = Encode2Points(cfg).to(device)
 
@@ -66,18 +66,17 @@ def main():
         name = data['name'][0]
 
         # ----- Get defective skull -----
-        # Simply load from SkullBreak dataset (no preprocessing)
-        if cfg['data']['dset'] == 'SkullBreak':
-            defective_skull, header = nrrd.read(os.path.join(name.split('/results')[0], 'defective_skull',
-                                                name.split('syn/')[1][:-8], name.split('_surf')[0][-3:] + '.nrrd'))
+        # Load from dataset broken object
+        defective_shape, header = nrrd.read(os.path.join(name.split('/results')[0], 'broken',
+                                            name.split('syn/')[1][:-8], name.split('_surf')[0][-3:] + '.nrrd'))
 
         # Load from SkullFix dataset with resampling, cropping and zero padding
-        if cfg['data']['dset'] == 'SkullFix':
-            defective_skull = readCT(os.path.join(name.split('/results')[0], 'defective_skull',
-                                                  name.split('_surf')[0][-3:] + '.nrrd'))
-            defective_skull, idx_x, idx_y, idx_z, shape = crop(defective_skull)
-            defective_skull, dim_x, dim_y, dim_z = padding(defective_skull)
-            defective_skull = defective_skull.astype(np.float32)
+        # if cfg['data']['dset'] == 'SkullFix':
+        #     defective_shape = readCT(os.path.join(name.split('/results')[0], 'broken',
+        #                                           name.split('_surf')[0][-3:] + '.nrrd'))
+        #     defective_shape, idx_x, idx_y, idx_z, shape = crop(defective_shape)
+        #     defective_shape, dim_x, dim_y, dim_z = padding(defective_shape)
+        #     defective_shape = defective_shape.astype(np.float32)
 
         inputs = data['inputs'][0, :, :, :]  # Input point cloud
         completes = np.zeros((512, 512, 512))
@@ -98,7 +97,7 @@ def main():
 
                 if cfg['generation']['save_ensemble_implants']:
                     # Postprocess the single implants and save the implants of the ensemble
-                    out = out - defective_skull
+                    out = out - defective_shape
                     out = dip.MedianFilter(out, dip.Kernel(shape='rectangular', param=(3, 3, 3)))
                     out.Convert('BIN')
                     out = dip.Closing(out, dip.SE((3, 3, 3)))
@@ -108,7 +107,7 @@ def main():
                     out = np.asarray(out, dtype=np.float32)
 
                     if cfg['data']['dset'] == 'SkullFix':
-                        util, header = nrrd.read(os.path.join(name.split('/results')[0], 'defective_skull',
+                        util, header = nrrd.read(os.path.join(name.split('/results')[0], 'broken',
                                                               name.split('_surf')[0][-3:] + '.nrrd'))
                         out = reverse_padding(out, dim_x, dim_y, dim_z)
                         out = reverse_crop(out, idx_x, idx_y, idx_z, shape)
@@ -139,7 +138,7 @@ def main():
         mean_complete = np.zeros((512, 512, 512))
         mean_complete[completes >= np.ceil(cfg['generation']['num_ensemble']/2)] = 1
 
-        mean_implant = mean_complete - defective_skull
+        mean_implant = mean_complete - defective_shape
         mean_implant = mean_implant.astype(bool)
         mean_implant = dip.Opening(mean_implant, dip.SE((3, 3, 3)))
         mean_implant = dip.Opening(mean_implant, dip.SE((3, 3, 3)))
@@ -155,18 +154,18 @@ def main():
             mean_implant = np.asarray(mean_implant, dtype=np.float32)
             gt_implant, _ = nrrd.read(os.path.join(name.split('/results')[0], 'implant',
                                                    name.split('syn/')[1][:-8], name.split('_surf')[0][-3:] + '.nrrd'))
-            defective_skull, header = nrrd.read(os.path.join(name.split('/results')[0], 'defective_skull',
-                                                             name.split('syn/')[1][:-8], name.split('_surf')[0][-3:] + '.nrrd'))
+            defective_shape, header = nrrd.read(os.path.join(name.split('/results')[0], 'broken',
+                                                             name.split('syn/')[1], name.split('broken')[1].split('/')[0] + '.obj'))
 
         if cfg['data']['dset'] == 'SkullFix':
             mean_implant = dip.Label(mean_implant, mode='largest')
             mean_implant = np.asarray(mean_implant, dtype=np.float32)
             gt_implant, _ = nrrd.read(os.path.join(name.split('/results')[0], 'implant',
                                                    name.split('_surf')[0][-3:] + '.nrrd'))
-            defective_skull, header = nrrd.read(os.path.join(name.split('/results')[0], 'defective_skull',
-                                                        name.split('_surf')[0][-3:] + '.nrrd'))
+            defective_shape, header = nrrd.read(os.path.join(name.split('/results')[0], 'broken',
+                                                        name.split('broken')[1].split('/')[0] + '.nrrd'))
 
-        new_shape = np.asarray(defective_skull.shape)
+        new_shape = np.asarray(defective_shape.shape)
         spacing = np.asarray([header['space directions'][0, 0],
                               header['space directions'][1, 1],
                               header['space directions'][2, 2]])
@@ -197,7 +196,7 @@ def main():
             eval_mets['dice'] = dice
             print("Dice score: " + str(dice))
 
-            bdice = bdc(mean_implant, gt_implant, defective_skull, voxelspacing=spacing)
+            bdice = bdc(mean_implant, gt_implant, defective_shape, voxelspacing=spacing)
             eval_mets['bdice'] = bdice
             print("Boundary dice (10mm): " + str(bdice))
 

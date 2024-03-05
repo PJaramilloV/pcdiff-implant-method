@@ -92,7 +92,7 @@ class SkullEval(data.Dataset):
         return(data)
 
 
-class SkullDataset(data.Dataset):
+class ObjectDataset(data.Dataset):
     def __init__(self, path, split, noise_stddev=None, outlier_ratio=None):
         self.split = split
         self.path = path

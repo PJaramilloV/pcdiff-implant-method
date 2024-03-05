@@ -7,7 +7,7 @@ import argparse
 import time
 from torch.utils.tensorboard import SummaryWriter
 from src import config
-from src.data import collate_remove_none, collate_stack_together, worker_init_fn, SkullDataset
+from src.data import collate_remove_none, collate_stack_together, worker_init_fn, ObjectDataset
 from src.training import Trainer
 from src.model import Encode2Points
 from src.utils import load_config, initialize_logger, AverageMeter, load_model_manual
@@ -56,11 +56,11 @@ def main():
     inputs = None
 
     # Dataloader for training set
-    train_dataset = SkullDataset(cfg['data']['train_path'], 'training', noise_stddev=cfg['data']['pointcloud_noise'])
+    train_dataset = ObjectDataset(cfg['data']['train_path'], 'training', noise_stddev=cfg['data']['pointcloud_noise'])
 
     # Dataloader for validation set
-    val_dataset = SkullDataset(cfg['data']['eval_path'], 'eval', noise_stddev=cfg['data']['pointcloud_noise'])
-    vis_dataset = SkullDataset(cfg['data']['eval_path'], 'viz', noise_stddev=cfg['data']['pointcloud_noise'])
+    val_dataset = ObjectDataset(cfg['data']['eval_path'], 'eval', noise_stddev=cfg['data']['pointcloud_noise'])
+    vis_dataset = ObjectDataset(cfg['data']['eval_path'], 'viz', noise_stddev=cfg['data']['pointcloud_noise'])
 
     collate_fn = collate_remove_none
 
