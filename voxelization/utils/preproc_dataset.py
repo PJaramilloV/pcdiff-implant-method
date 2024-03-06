@@ -3,10 +3,12 @@ import argparse
 import multiprocessing
 import numpy as np
 from tqdm import tqdm
+import nrrd
 import time
 import csv
 import trimesh
-
+import open3d as o3d
+import scipy.ndimage as sci
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--multiprocessing', type=eval, default=True, help="set multiprocessing True/False")
@@ -15,6 +17,7 @@ parser.add_argument('--num_points', type=int, default=30720, help="number of poi
 parser.add_argument('--num_nn', type=int, default=3072, help="number of points that represent the implant")
 parser.add_argument('--dataset', type=str, default='_bottles', required=True, help="set dataset name")
 parser.add_argument('--path', type=str, default='data/pjaramil/', help="set dataset path")
+parser.add_argument('--format', type=str, default='obj', help="extension file format of original data (default= 'obj')", choices=['obj', 'nrrd'])
 opt = parser.parse_args()
 
 multiprocess = opt.multiprocessing
@@ -23,6 +26,7 @@ save_pointcloud = True
 save_psr_field = True
 num_points = opt.num_points
 num_nn = opt.num_nn
+ex_format = f'.{opt.format}'
 padding = 1.2
 mesh_factor = 1.1
 
@@ -87,9 +91,14 @@ def obj_to_vox(file):
 
 
 def process_one(obj):
-    pc_np   = np.load(obj['broken'])  # Defective skull pc
+    pc_np   = np.load(obj['broken'])  # Defective pc
     pc_d_np = np.load(obj['repair'])  # Implant pc
-    gt_vox = obj_to_vox(obj['gt_vox'])  # Gt vox
+    if ex_format == '.obj':            # Gt vox
+        gt_vox = obj_to_vox(obj['gt_vox'])  
+    elif ex_format == '.nrrd':
+        gt_vox, _ = nrrd.read(obj['gt_vox'])
+    else:
+        raise TypeError(f"Unsupported data type: {ex_format}")
 
     # Downsample point clouds, broken and desired repair
     num_pc = pc_np.shape[0]
@@ -105,7 +114,7 @@ def process_one(obj):
     # normalize pc
     max_val = np.max(points)
     min_val = np.min(points)
-    points = (points - min_val / max_val - min_val) *0.85
+    points = ((points - min_val) / (max_val - min_val)) *0.95
 
     # center pointcloud on x-y with z floored
     min_x, max_x = np.min(points[:, 0]), np.max(points[:, 0])
@@ -123,7 +132,7 @@ def process_one(obj):
 
     # save
     path = obj['broken'].split('/broken')[0]
-    obj_name = obj['gt_vox'].split('/')[-1].split('.obj')[0]
+    obj_name = obj['gt_vox'].split('/')[-1].split(ex_format)[0]
     name_vox = os.path.join(path, 'voxelization', obj_name + '_vox.npz')
     name_points = os.path.join(path, 'voxelization', obj_name + '_pc.npz')
 
@@ -143,7 +152,6 @@ def main():
     print('---------------------------------------')
     
     dataset_csv = os.path.join(dataset_path, dataset_name , f'{dataset_name}.csv')
-    defects = ['broken']
     database = []
 
     vox_dir = os.path.join(dataset_path, dataset_name, 'voxelization')
@@ -155,7 +163,7 @@ def main():
         for row in csv_reader:
             split = row[0].split('complete')
             path = split[0]
-            file = split[1].split('.obj')[0][1:] # /file.obj
+            file = split[1].split(ex_format)[0][1:] # -->/file<--.obj
             datapoint = dict()
             datapoint['broken'] = os.path.join( path , 'broken' , file + '.npy')
             datapoint['repair'] = os.path.join( path , 'repair' , file + '.npy')
