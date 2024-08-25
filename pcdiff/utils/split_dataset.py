@@ -7,7 +7,7 @@ import argparse
 
 data_dir = 'data/pjaramil/'
 parser = argparse.ArgumentParser()
-parser.add_argument('--dataset', type=str, default='_bottles', help="set dataset name")
+parser.add_argument('--dataset', type=str, default='', required=True, help="set dataset name")
 opt = parser.parse_args()
 dataset = opt.dataset
 

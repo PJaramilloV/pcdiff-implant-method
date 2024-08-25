@@ -1,6 +1,7 @@
 import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.optim as optim
+import torch.utils
 import torch.utils.data
 
 import argparse
@@ -398,9 +399,9 @@ class PVCNN2(PVCNN2Base):
     num_n = 128 # Number of neighbors
 
     # Define set abstraction layers
-    sa_blocks = [((32, 2, 32), (10240, 0.1, num_n, (32, 64))),
-                 ((64, 3, 16), (2560, 0.2, num_n, (64, 128))),
-                 ((128, 3, 8), (640, 0.4, num_n, (128, 256))),
+    sa_blocks = [((32, 2, 32), (4096, 0.1, num_n, (32, 64))),
+                 ((64, 3, 16), (2048, 0.2, num_n, (64, 128))),
+                 ((128, 3, 8), (512, 0.4, num_n, (128, 256))),
                  (None, (160, 0.8, num_n, (256, 256, 512))),
                  ]
 
@@ -544,7 +545,7 @@ def get_dataloader(opt, train_dataset, test_dataset=None):
     return train_dataloader, test_dataloader, train_sampler, test_sampler
 
 
-def train(gpu, opt, output_dir, noises_init):
+def train(gpu, opt, output_dir):
     logger = setup_logging(output_dir)
 
     if opt.distribution_type == 'multi':
@@ -575,6 +576,7 @@ def train(gpu, opt, output_dir, noises_init):
     ''' Dataset and data loader '''
     train_dataset = get_dataset(opt.num_points, opt.num_nn, opt.path, opt.dataset, opt.augment)
     dataloader, _, train_sampler, _ = get_dataloader(opt, train_dataset, None)
+    noises_init = torch.randn(len(dataloader.dataset), opt.num_nn, 3)
 
     ''' Create networks '''
     betas = get_betas(opt.schedule_type, opt.beta_start, opt.beta_end, opt.time_num)
@@ -723,8 +725,8 @@ def main():
     output_dir = get_output_dir(dir_id, exp_id)
     copy_source(__file__, output_dir)
 
-    ''' Workaround '''
-    noises_init = torch.randn(1000, opt.num_nn, 3)  # Init noise (num_nn random points)
+    # ''' Workaround '''
+    # noises_init = torch.randn(1180, opt.num_nn, 3)  # Init noise (num_nn random points)    # dim 0 = 1000 (bottles) 1180 (cups)
 
     if opt.dist_url == "env://" and opt.world_size == -1:
         opt.world_size = int(os.environ["WORLD_SIZE"])
@@ -732,10 +734,10 @@ def main():
     if opt.distribution_type == 'multi':
         opt.ngpus_per_node = torch.cuda.device_count()
         opt.world_size = opt.ngpus_per_node * opt.world_size
-        mp.spawn(train, nprocs=opt.ngpus_per_node, args=(opt, output_dir, noises_init))
+        mp.spawn(train, nprocs=opt.ngpus_per_node, args=(opt, output_dir))
 
     else:
-        train(opt.gpu, opt, output_dir, noises_init)
+        train(opt.gpu, opt, output_dir)
 
 
 def parse_args():
@@ -797,9 +799,9 @@ def parse_args():
 
     ''' Evaluation '''
     parser.add_argument('--saveIter', type=int, default=1000, help='unit: epoch')
-    parser.add_argument('--diagIter', type=int, default=2000, help='unit: epoch')
-    parser.add_argument('--vizIter', type=int, default=2000, help='unit: epoch')
-    parser.add_argument('--print_freq', type=int, default=10, help='unit: iter')
+    parser.add_argument('--diagIter', type=int, default=1000, help='unit: epoch')
+    parser.add_argument('--vizIter', type=int, default=1000, help='unit: epoch')
+    parser.add_argument('--print_freq', type=int, default=2, help='unit: iter')
 
     # Manual seed for deterministic sampling, etc.
     parser.add_argument('--manualSeed', default=1234, type=int, help='random seed')

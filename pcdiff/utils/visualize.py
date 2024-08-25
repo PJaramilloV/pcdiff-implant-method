@@ -227,3 +227,4 @@ def plot_stats(output_dir, stats, interval):
 
     f.savefig(os.path.join(output_dir, 'stat.pdf'), bbox_inches='tight')
     plt.close(f)
+

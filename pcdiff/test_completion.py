@@ -197,7 +197,8 @@ class GaussianDiffusion:
 
         img_t = torch.cat([partial_x, noise], dim=-1)
 
-        for t in tqdm(reversed(range(0, self.num_timesteps if not keep_running else len(self.betas))), total=1000):
+        iters = self.num_timesteps if not keep_running else len(self.betas)
+        for t in tqdm(reversed(range(0, iters)), total=iters):
             t_ = torch.empty(shape[0], dtype=torch.int64, device=device).fill_(t)
             img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t, t=t_, noise_fn=noise_fn,
                                   clip_denoised=clip_denoised, return_pred_xstart=False)
@@ -370,9 +371,9 @@ class PVCNN2(PVCNN2Base):
     num_n = 128
 
     # Define set abstraction layers
-    sa_blocks = [((32, 2, 32), (10240, 0.1, num_n, (32, 64))),
-                 ((64, 3, 16), (2560, 0.2, num_n, (64, 128))),
-                 ((128, 3, 8), (640, 0.4, num_n, (128, 256))),
+    sa_blocks = [((32, 2, 32), (4096, 0.1, num_n, (32, 64))),
+                 ((64, 3, 16), (2048, 0.2, num_n, (64, 128))),
+                 ((128, 3, 8), (512, 0.4, num_n, (128, 256))),
                  (None, (160, 0.8, num_n, (256, 256, 512))),
                  ]
 
@@ -503,9 +504,39 @@ def get_betas(schedule_type, b_start, b_end, time_num):
 
 #############################################################################
 def get_dataset(path, num_points, num_nn, dataset):
+
     te_dataset = BrokenDataset(path=path, num_points=num_points, num_nn=num_nn, norm_mode='shape_bbox',
                                        eval=True)
+
     return te_dataset
+
+def force_c_view(arr, dtype):
+    if arr.flags['C_CONTIGUOUS']:
+        return arr.view(dtype)
+    if arr.flags['F_CONTIGUOUS']:
+        arr = np.require(arr, requirements=['C'], dtype=np.float32)
+        return arr.view(dtype)
+    raise BufferError("To change the data type of an array it must be either C-CONTIGUOUS or F-CONTIGUOUS")
+
+
+def make_difference(train, repair):
+    train = train.numpy()
+    in_type = train.dtype
+    if in_type != repair.dtype:
+        raise TypeError(f"Mismatching value types {in_type} and {repair.dtype}")
+
+    dtype = [('batch', in_type),('point', in_type),('xyz', in_type)]
+
+    in_arr = train.reshape(-1,3)
+    sa_arr = repair.reshape(-1,3)
+    reshaped_in = force_c_view(in_arr, dtype)
+    reshaped_sa = force_c_view(sa_arr, dtype)
+
+    reshaped_diff = np.setdiff1d(reshaped_sa, reshaped_in)
+
+    diff_pc = reshaped_diff.view(in_type).reshape(-1,3)
+    diff_pc = diff_pc[np.newaxis, :, :]
+    return diff_pc
 
 
 def evaluate_recon_mvr(opt, model, save_dir):
@@ -537,7 +568,7 @@ def evaluate_recon_mvr(opt, model, save_dir):
 
         np.save(os.path.join(save_dir, name, 'input.npy'), np.asarray(data['train_points']))  # save the input points
         np.save(os.path.join(save_dir, name, 'sample.npy'), sample_np)  # save the sampled point clouds (implants)
-        #np.save(os.path.join(save_dir, name, 'difference.npy'), np.asarray(data['train_points'])-sample_np)
+        np.save(os.path.join(save_dir, name, 'difference.npy'), make_difference(data['train_points'], sample_np))
         np.save(os.path.join(save_dir, name, 'shift.npy'), np.asarray(data['shift']))  # save shift
         np.save(os.path.join(save_dir, name, 'scale.npy'), np.asarray(data['scale']))  # save scale
     return
@@ -556,6 +587,8 @@ def main(opt):
                   vox_res_mult=opt.vox_res_mult)
 
     def _transform_(m):
+        if isinstance(opt.gpu, int):
+            return nn.parallel.DataParallel(m, device_ids=[opt.gpu])
         return nn.parallel.DataParallel(m)
 
     torch.cuda.set_device(opt.gpu)
