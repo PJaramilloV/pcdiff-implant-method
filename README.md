@@ -12,6 +12,10 @@ This work agrees with the statements of its source for Diffusion Models to be a 
 
 In order to run this model you will need at minimum a GPU with 8GB of memory, though more memory or more GPUs are required to run at higher point cloud density. For best performance it is recommended that your dataset has somewhere between 900 to 2000 data points, split in a 75-25 or 70-30 train-test ratio, should your dataset be smaller augmentation is suggested. The point count of the point clouds should be fixed at no lower than 4000. The convergence of the Point Cloud Diffusion Model may be expected within 400 to 500 epochs following this configuration.
 
+## Data
+
+The dataset utilized in this work is a highly-sanitized mix of ShapeNet's Bowl class, ModelNet40's Bowl class, and Native American Pottery from the dataset of [Data-Driven Restoration of Cultural Heritage Objects with Point Cloud Analysis](https://github.com/ivansipiran/Data-driven-cultural-heritage). The dataset is available [here](https://github.com/PJaramilloV/Precolombian-Dataset).
+
 ## Acknowledgements
 
 The neural network model code is authored by Friedrich et al. Published under a MIT License, this license is kept as-is without change from the original repository. Friedrich's helpful disposition was appreaciated when first starting the project.
